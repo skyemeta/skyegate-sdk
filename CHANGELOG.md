@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.4.8
+
+- `validateContentToken` takes `expectedWallet: { address, walletType? }`: the wallet your own
+  server-side sign-in proved. The JWT must name that wallet as `sub`, and every signed result must
+  be on its chain family, or `pass` is `false`. Strongly recommended: a JWT with `pass: true` can be
+  requested for any public wallet directly from InsumerAPI, so without it a server cannot tell such
+  a JWT from one its own visitor earned. Existing calls without the option behave as before.
+- README and the Next.js example show the option with a session of your own.
+
 ## 0.4.7
 
 - Documentation: `nft_ownership` checks ERC-721 and SPL NFT ownership. ERC-1155 is no longer listed.

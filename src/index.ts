@@ -138,6 +138,18 @@ export interface ValidateContentTokenOptions {
    * `decimals` is ignored (it is never signed). An unknown template never matches.
    */
   expectedConditions?: Condition[];
+  /**
+   * The wallet the person presenting this JWT has proven they control, through your own
+   * server-side sign-in (for example a Sign-In with Ethereum session you verified), never a
+   * value the browser sends with the JWT.
+   *
+   * Strongly recommended. Anyone can obtain a valid attestation JWT for any public wallet
+   * straight from InsumerAPI, without the SkyeGate proxy and without proving they control that
+   * wallet. Without this option, `validateContentToken` cannot tell that JWT from one your own
+   * visitor earned. With it, the JWT must name this wallet as `sub`, and every signed result must
+   * be on that wallet's chain family, or the call returns `pass: false`.
+   */
+  expectedWallet?: { address: string; walletType?: WalletType };
   /** The `pqJwt` sibling returned with the JWT, if you have it. Reported as `pq` in the result. */
   pqJwt?: string;
   /**
@@ -567,6 +579,48 @@ function sameChain(a: unknown, b: unknown): boolean {
   return String(a).toLowerCase() === String(b).toLowerCase();
 }
 
+const NON_EVM_CHAINS: ReadonlySet<string> = new Set(['solana', 'xrpl', 'bitcoin', 'tron', 'stellar', 'sui']);
+
+/** The wallet family a signed result was evaluated on, or null when it cannot be told. */
+function resultFamily(result: any): WalletType | null {
+  const signed = result?.evaluatedCondition;
+  if (!signed || typeof signed !== 'object') return null;
+  const c = signed.chainId;
+  if (typeof c === 'number' && Number.isInteger(c) && c > 0) return 'evm';
+  if (typeof c === 'string') {
+    if (/^[1-9][0-9]*$/.test(c)) return 'evm';
+    const name = c.toLowerCase();
+    return NON_EVM_CHAINS.has(name) ? (name as WalletType) : null;
+  }
+  // A Farcaster identity is read for an EVM address; it is the only type signed without a chain.
+  if (c === undefined && signed.type === 'farcaster_id') return 'evm';
+  return null;
+}
+
+/** EVM and Sui addresses are hex, so case does not matter. The rest are case-sensitive. */
+function sameWallet(a: unknown, b: string, family: WalletType): boolean {
+  if (typeof a !== 'string' || !a || !b) return false;
+  if (family === 'evm' || family === 'sui') return a.toLowerCase() === b.toLowerCase();
+  return a === b;
+}
+
+/**
+ * Is this JWT about the wallet the caller proved, and only that wallet? `sub` names one wallet,
+ * so a token that also evaluated another family's wallet is not bound to it.
+ */
+function boundToWallet(payload: JWTPayload & { results?: unknown[] }, expected: { address: string; walletType?: WalletType }): string | null {
+  const family: WalletType = expected.walletType ?? 'evm';
+  if (!Object.prototype.hasOwnProperty.call(WALLET_FIELD, family)) return `expectedWallet.walletType is not a wallet type: ${String(family)}`;
+  if (typeof expected.address !== 'string' || !expected.address.trim()) return 'expectedWallet.address is empty';
+  if (!sameWallet(payload.sub, expected.address.trim(), family)) return 'JWT is about a different wallet than the one this session proved';
+  const results = Array.isArray(payload.results) ? payload.results : [];
+  if (results.length === 0) return 'JWT carries no signed results';
+  for (const r of results) {
+    if (resultFamily(r) !== family) return 'JWT evaluates a wallet outside the proven wallet\'s chain family';
+  }
+  return null;
+}
+
 const nfc = (v: unknown) => (typeof v === 'string' ? v.normalize('NFC') : v);
 
 /**
@@ -626,6 +680,12 @@ function matchesExpected(result: any, expected: Condition): boolean {
  * what your route requires — preventing a JWT earned for one condition set
  * from being replayed against a different one.
  *
+ * Important: a valid JWT with `pass: true` says a wallet meets the conditions. It does not
+ * say the person presenting it controls that wallet, or that it came through the SkyeGate
+ * proxy. Anyone can request one for any public wallet directly from InsumerAPI. Pass
+ * `expectedWallet` (the wallet your own server-side sign-in proved) so a JWT about someone
+ * else's wallet is refused.
+ *
  * Caching: nothing here caches a verdict, so every call re-verifies the signature.
  * If you add a cache, key it on something only the person who passed could produce
  * (the JWT itself, or a session you issued them) — never on the wallet address or a
@@ -639,9 +699,11 @@ function matchesExpected(result: any, expected: Condition): boolean {
  *
  * export async function POST(req: Request) {
  *   const { jwt, pqJwt } = await req.json();
+ *   const session = await getSession(req); // your own sign-in, verified on the server
  *   const result = await validateContentToken(jwt, {
  *     pqJwt, // the post-quantum companion returned beside jwt; reported as result.pq
  *     expectedConditions: [{ type: 'farcaster_id' }],
+ *     expectedWallet: { address: session.wallet },
  *   });
  *   if (!result.pass) {
  *     return Response.json({ error: result.error }, { status: 403 });
@@ -689,6 +751,11 @@ export async function validateContentToken(
 
   if (payload.pass !== true) {
     return { valid: true, pass: false, payload, pq, error: 'Verification did not pass' };
+  }
+
+  if (options.expectedWallet !== undefined) {
+    const unbound = boundToWallet(payload, options.expectedWallet);
+    if (unbound) return { valid: true, pass: false, payload, pq, error: unbound };
   }
 
   if (options.expectedConditions && options.expectedConditions.length > 0) {

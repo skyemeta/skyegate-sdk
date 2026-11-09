@@ -1,6 +1,6 @@
 {
   "name": "@skyemeta/skyegate",
-  "version": "0.4.7",
+  "version": "0.4.8",
   "description": "SkyeGate Pro for Vercel — condition-based content gating for Next.js apps. Powered by InsumerAPI. Companion to the SkyeGate WordPress plugin: same SKYE license key, one license, two stacks.",
   "type": "module",
   "main": "build/index.js",
@@ -24,7 +24,8 @@
   ],
   "scripts": {
     "build": "tsc",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run build",
+    "test": "npm run build && node --test test/*.test.mjs"
   },
   "keywords": [
     "skyegate",
