@@ -116,6 +116,12 @@ export interface VerifyConditionsResult {
    * Pass it alongside `jwt` to {@link validateContentToken} as `options.pqJwt`.
    */
   pqJwt: string | null;
+  /**
+   * Skye Meta's receipt for this attestation, present on a pass when the call came through a
+   * licensed (or trial) gate and every wallet named was proven by its owner. Send it to your
+   * server beside `jwt`; {@link validateContentToken} requires it.
+   */
+  receipt?: string;
   /** Full InsumerAPI response envelope, for advanced inspection. */
   raw: unknown;
   /**
@@ -131,13 +137,33 @@ export interface ValidateContentTokenOptions {
   /** Expected `iss` claim. Defaults to InsumerAPI. */
   issuer?: string;
   /**
-   * Optional replay protection: ensure the signed conditions in the JWT match
-   * the conditions you require for this route. Pass the same conditions you gave
-   * {@link verifyConditions}: each must match one signed result. `template` is
-   * checked through what it resolves to, `label` against the signed label, and
-   * `decimals` is ignored (it is never signed). An unknown template never matches.
+   * Required. The conditions this route requires: the same ones you gave
+   * {@link verifyConditions}. Each must match one signed result, so a JWT earned for one
+   * condition set cannot open another route. `template` is checked through what it resolves
+   * to, `label` against the signed label, and `decimals` is ignored (it is never signed). An
+   * unknown template never matches.
    */
-  expectedConditions?: Condition[];
+  expectedConditions: Condition[];
+  /**
+   * Required unless `allowDirectAttestations` is set. The `receipt` that came back from
+   * {@link verifyConditions} with the JWT. It is Skye Meta's signed statement that this exact
+   * attestation came through your licensed gate for a wallet its owner proved.
+   */
+  receipt?: string;
+  /**
+   * Required with a receipt. Your site's domain as your gate sends it (the browser's hostname
+   * without `www.` or a port, or the `domain` you pass to `verifyConditions`). A receipt issued
+   * for any other site is refused. Pass an array to accept several (for example a preview host).
+   */
+  audience?: string | string[];
+  /**
+   * Accept a JWT without a Skye Meta receipt. Only for servers that prove the presenter's wallet
+   * themselves: pair it with `expectedWallet`. Without either, anyone can pass the gate with a
+   * JWT requested directly from InsumerAPI for someone else's wallet.
+   */
+  allowDirectAttestations?: boolean;
+  /** Override where receipt keys are read. Defaults to https://skyemeta.com/.well-known/skyegate-jwks.json. */
+  receiptJwksUrl?: string;
   /**
    * The wallet the person presenting this JWT has proven they control, through your own
    * server-side sign-in (for example a Sign-In with Ethereum session you verified), never a
@@ -239,6 +265,9 @@ function withStringThresholds(conditions: Condition[]): Condition[] {
 const DEFAULT_VERIFY_ENDPOINT = 'https://skyemeta.com/api/verify';
 const DEFAULT_PROOF_ENDPOINT = 'https://skyemeta.com/api/wallet-proof';
 const DEFAULT_JWKS_URL = 'https://api.insumermodel.com/.well-known/jwks.json';
+const DEFAULT_RECEIPT_JWKS_URL = 'https://skyemeta.com/.well-known/skyegate-jwks.json';
+const RECEIPT_ISSUER = 'https://skyemeta.com';
+const RECEIPT_TYP = 'skyegate-receipt+jwt';
 const DEFAULT_ISSUER = 'https://api.insumermodel.com';
 // Content tokens are attestation JWTs: only InsumerAPI's attestation signing keys issue them.
 const DEFAULT_ATTEST_KIDS = ['insumer-attest-v1', 'insumer-attest-v2'];
@@ -273,7 +302,7 @@ const DEFAULT_ATTEST_KIDS = ['insumer-attest-v1', 'insumer-attest-v2'];
  * });
  *
  * if (result.pass && result.jwt) {
- *   // POST result.jwt to your /api/gated-content endpoint
+ *   // POST result.jwt and result.receipt to your /api/gated-content endpoint
  * }
  * ```
  */
@@ -352,8 +381,9 @@ export async function verifyConditions(
   const jwt = data?.data?.jwt ?? null;
   const pqJwt = typeof data?.data?.pqJwt === 'string' ? data.data.pqJwt : null;
   const pass = attestation?.pass === true;
+  const receipt = typeof data?.receipt === 'string' ? data.receipt : undefined;
 
-  return { pass, jwt, pqJwt, raw: data };
+  return receipt ? { pass, jwt, pqJwt, receipt, raw: data } : { pass, jwt, pqJwt, raw: data };
 }
 
 // The proxy passes InsumerAPI errors through as { code, message }; its own are strings.
@@ -621,6 +651,49 @@ function boundToWallet(payload: JWTPayload & { results?: unknown[] }, expected: 
   return null;
 }
 
+/** base64url(SHA-256(text)), with Web Crypto where the runtime has it, else Node's. */
+async function sha256B64url(text: string): Promise<string> {
+  let subtle: SubtleCrypto | undefined = (globalThis as any).crypto?.subtle;
+  if (!subtle) {
+    const name = 'node:crypto';
+    subtle = ((await import(/* webpackIgnore: true */ /* turbopackIgnore: true */ /* @vite-ignore */ name)) as any).webcrypto.subtle;
+  }
+  const digest = new Uint8Array(await subtle!.digest('SHA-256', new TextEncoder().encode(text)));
+  let bin = '';
+  for (const b of digest) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+
+/**
+ * Check Skye Meta's receipt for an attestation: signed by a key in the receipt JWKS, issued by
+ * Skye Meta for this site, about the same wallet, and for exactly this JWT.
+ * Returns null when it holds, or the reason it does not.
+ */
+async function receiptRefusal(receipt: unknown, jwt: string, sub: unknown, options: ValidateContentTokenOptions): Promise<string | null> {
+  if (typeof receipt !== 'string' || !receipt) {
+    return 'Missing receipt: pass the receipt that came back from verifyConditions with the JWT';
+  }
+  const audience = options.audience;
+  if (!audience || (Array.isArray(audience) && audience.length === 0)) {
+    return 'audience is required to check a receipt: pass your site\'s domain';
+  }
+  try {
+    const { payload } = await jwtVerify(receipt, getJwks(options.receiptJwksUrl ?? DEFAULT_RECEIPT_JWKS_URL), {
+      issuer: RECEIPT_ISSUER,
+      audience,
+      algorithms: ['ES256'],
+      typ: RECEIPT_TYP,
+    });
+    if (typeof payload.ath !== 'string' || payload.ath !== (await sha256B64url(jwt))) {
+      return 'Receipt is for a different attestation';
+    }
+    if (typeof sub !== 'string' || payload.sub !== sub) return 'Receipt names a different wallet';
+  } catch (err) {
+    return `Receipt did not verify: ${err instanceof Error ? err.message : 'invalid'}`;
+  }
+  return null;
+}
+
 const nfc = (v: unknown) => (typeof v === 'string' ? v.normalize('NFC') : v);
 
 /**
@@ -680,11 +753,14 @@ function matchesExpected(result: any, expected: Condition): boolean {
  * what your route requires — preventing a JWT earned for one condition set
  * from being replayed against a different one.
  *
- * Important: a valid JWT with `pass: true` says a wallet meets the conditions. It does not
- * say the person presenting it controls that wallet, or that it came through the SkyeGate
- * proxy. Anyone can request one for any public wallet directly from InsumerAPI. Pass
- * `expectedWallet` (the wallet your own server-side sign-in proved) so a JWT about someone
- * else's wallet is refused.
+ * A JWT with `pass: true` says a wallet meets the conditions. On its own it does not say the
+ * person presenting it controls that wallet, or that it came through your SkyeGate gate:
+ * anyone can request one for any public wallet directly from InsumerAPI. So this function
+ * also requires Skye Meta's `receipt` for the JWT, issued for your `audience` (your domain),
+ * which says the attestation came through your licensed gate for a wallet its owner proved.
+ * `expectedConditions` is required too. If your server proves the presenter's wallet itself,
+ * pass `expectedWallet`; `allowDirectAttestations: true` then lets a JWT through without a
+ * receipt.
  *
  * Caching: nothing here caches a verdict, so every call re-verifies the signature.
  * If you add a cache, key it on something only the person who passed could produce
@@ -698,12 +774,12 @@ function matchesExpected(result: any, expected: Condition): boolean {
  * import { validateContentToken } from '@skyemeta/skyegate';
  *
  * export async function POST(req: Request) {
- *   const { jwt, pqJwt } = await req.json();
- *   const session = await getSession(req); // your own sign-in, verified on the server
+ *   const { jwt, receipt, pqJwt } = await req.json();
  *   const result = await validateContentToken(jwt, {
- *     pqJwt, // the post-quantum companion returned beside jwt; reported as result.pq
+ *     receipt,                 // from verifyConditions, beside jwt
+ *     audience: 'example.com', // your site's domain
  *     expectedConditions: [{ type: 'farcaster_id' }],
- *     expectedWallet: { address: session.wallet },
+ *     pqJwt, // the post-quantum companion returned beside jwt; reported as result.pq
  *   });
  *   if (!result.pass) {
  *     return Response.json({ error: result.error }, { status: 403 });
@@ -714,10 +790,14 @@ function matchesExpected(result: any, expected: Condition): boolean {
  */
 export async function validateContentToken(
   jwt: string,
-  options: ValidateContentTokenOptions = {}
+  options: ValidateContentTokenOptions
 ): Promise<ValidateContentTokenResult> {
   if (!jwt || typeof jwt !== 'string') {
     return { valid: false, pass: false, error: 'Missing or invalid JWT' };
+  }
+  // Configuration errors are reported on every call, before anything is checked.
+  if (!options || !Array.isArray(options.expectedConditions) || options.expectedConditions.length === 0) {
+    return { valid: false, pass: false, error: 'expectedConditions is required: pass the conditions this route requires' };
   }
 
   const jwksUrl = options.jwksUrl ?? DEFAULT_JWKS_URL;
@@ -753,12 +833,17 @@ export async function validateContentToken(
     return { valid: true, pass: false, payload, pq, error: 'Verification did not pass' };
   }
 
+  if (!options.allowDirectAttestations) {
+    const refused = await receiptRefusal(options.receipt, jwt, payload.sub, options);
+    if (refused) return { valid: true, pass: false, payload, pq, error: refused };
+  }
+
   if (options.expectedWallet !== undefined) {
     const unbound = boundToWallet(payload, options.expectedWallet);
     if (unbound) return { valid: true, pass: false, payload, pq, error: unbound };
   }
 
-  if (options.expectedConditions && options.expectedConditions.length > 0) {
+  {
     const signed = Array.isArray(payload.results) ? (payload.results as any[]) : [];
     const allMatched = options.expectedConditions.every((expected) =>
       signed.some(

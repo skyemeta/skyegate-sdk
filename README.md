@@ -61,11 +61,11 @@ export default function Page() {
       licenseKey={process.env.NEXT_PUBLIC_SKYE_LICENSE_KEY!}
       loading={<p>Verifying...</p>}
       fallback={<p>Connect a Farcaster-linked wallet to view this.</p>}
-      onPass={async (jwt, pqJwt) => {
+      onPass={async (jwt, pqJwt, receipt) => {
         const res = await fetch('/api/gated-content', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ jwt, pqJwt }),
+          body: JSON.stringify({ jwt, receipt, pqJwt }),
         });
         const { secret } = await res.json();
         // render `secret` somewhere
@@ -84,11 +84,11 @@ export default function Page() {
 import { validateContentToken } from '@skyemeta/skyegate';
 
 export async function POST(req: Request) {
-  const { jwt, pqJwt } = await req.json();
-  const session = await getSession(req); // your own sign-in (for example SIWE), checked on the server
+  const { jwt, receipt, pqJwt } = await req.json();
   const result = await validateContentToken(jwt, {
-    expectedConditions: [{ type: 'farcaster_id' }],
-    expectedWallet: { address: session.wallet }, // the wallet this visitor proved they control
+    receipt,                                         // Skye Meta's receipt, from verifyConditions
+    audience: 'yoursite.com',                        // your domain, without www. or a port
+    expectedConditions: [{ type: 'farcaster_id' }],  // the conditions this route requires
     pqJwt, // post-quantum companion; reported as result.pq, refuted always fails
   });
   if (!result.pass) {
@@ -100,7 +100,7 @@ export async function POST(req: Request) {
 
 The browser only ever receives the gated content after the JWT clears server-side validation. The text isn't in the page source or the bundle; it's fetched only after a signed verification.
 
-**Pass `expectedWallet`.** A JWT with `pass: true` says a wallet meets the conditions. It does not say the person sending it controls that wallet, or that it came through the SkyeGate proxy: anyone can request one for any public wallet straight from InsumerAPI. `expectedWallet` closes that gap. Give it the wallet your own server-side sign-in proved, never a value the browser sends with the JWT, and a token about any other wallet is refused. Without a sign-in of your own, the JWT alone cannot show who is presenting it.
+**Why the receipt.** A JWT with `pass: true` says a wallet meets the conditions. It does not say the person sending it controls that wallet, or that it came through your gate: anyone can request one for any public wallet straight from InsumerAPI. The receipt closes that. Skye Meta's proxy signs it only when the call came through your license for a wallet whose owner signed the ownership challenge, for your domain, and for exactly this JWT. `validateContentToken` refuses a JWT without one. If your server already proves the visitor's wallet with a sign-in of its own, you can pass `expectedWallet` with that wallet and `allowDirectAttestations: true` instead.
 
 ### If you cache the result, key it on the JWT
 
@@ -132,7 +132,7 @@ Low-level imperative call. The React hook + component use this internally.
 | `endpoint` | `string` | Override the proxy URL (advanced) |
 | `walletProof` | `string` | Proof token from `proveWalletOwnership`. **Required for licensed EVM calls**: the proxy rejects them with 403 `wallet_proof_required` without it. See **Wallet ownership** below |
 
-Returns `{ pass, jwt, pqJwt, raw, error? }`. `error` is always a string, and is set only when no verdict came back (a refused request, a license problem, an outage); a signed "not met" is `pass: false` with no `error`. On `pass:true`, hand `jwt` and `pqJwt` (the post-quantum companion, when present) to your server endpoint and call `validateContentToken` there with `pqJwt` in the options.
+Returns `{ pass, jwt, pqJwt, receipt?, raw, error? }`. `error` is always a string, and is set only when no verdict came back (a refused request, a license problem, an outage); a signed "not met" is `pass: false` with no `error`. On `pass:true`, hand `jwt`, `receipt` and `pqJwt` (the post-quantum companion, when present) to your server endpoint and call `validateContentToken` there with `receipt` and `pqJwt` in the options. `receipt` is present when the call carried a license and an ownership proof for every wallet it named.
 
 ### `proveWalletOwnership(params)` → `Promise<ProveWalletOwnershipResult>`
 
@@ -148,16 +148,20 @@ Proves the person present controls the wallet, not just that an address was supp
 
 Returns `{ proofToken, expiresInSec?, error? }`. The token is session-scoped: prove once when the wallet connects, then pass it as `walletProof` to every `verifyConditions` call for the rest of the visit. EVM wallets only in this wave.
 
-### `validateContentToken(jwt, options?)` → `Promise<ValidateContentTokenResult>`
+### `validateContentToken(jwt, options)` → `Promise<ValidateContentTokenResult>`
 
-Server-side JWT validation. Verifies the ECDSA P-256 signature against InsumerAPI's JWKS, checks issuer + expiry, and (optionally) confirms the signed conditions match what your route requires.
+Server-side JWT validation. Verifies the ECDSA P-256 signature against InsumerAPI's JWKS, checks issuer + expiry, checks Skye Meta's receipt for the JWT, and confirms the signed conditions match what your route requires.
 
 | Option | Type | Notes |
 |---|---|---|
 | `jwksUrl` | `string` | Default: InsumerAPI's public JWKS |
 | `issuer` | `string` | Default: `https://api.insumermodel.com` |
-| `expectedConditions` | `Condition[]` | Replay protection: pass the same conditions you gave `verifyConditions`, and each must match a signed result. `template` is checked through what it resolves to (an unknown template never matches), `label` against the signed label, `chainId` as a number or numeric string, addresses case-insensitively; `decimals` is ignored because it is never signed |
-| `expectedWallet` | `{ address, walletType? }` | Strongly recommended. The wallet your own server-side sign-in proved. The JWT's `sub` must be this wallet (case-insensitive for EVM and Sui, exact for the others) and every signed result must be on its chain family (`walletType`, default `'evm'`); otherwise `pass` is `false` |
+| `receipt` | `string` | Required (unless `allowDirectAttestations`). The `receipt` from `verifyConditions`. Must be signed by a key at `https://skyemeta.com/.well-known/skyegate-jwks.json`, issued for your `audience`, name the JWT's wallet, and carry the hash of this exact JWT |
+| `audience` | `string \| string[]` | Required with a receipt. Your site's domain as the gate sends it: the hostname without `www.` or a port (or the `domain` you pass to `verifyConditions`). Pass several to accept a preview host too |
+| `allowDirectAttestations` | `boolean` | Accept a JWT with no receipt. Only for servers that prove the presenter's wallet themselves; pair it with `expectedWallet` |
+| `receiptJwksUrl` | `string` | Default: `https://skyemeta.com/.well-known/skyegate-jwks.json` |
+| `expectedConditions` | `Condition[]` | Required. Replay protection: pass the same conditions you gave `verifyConditions`, and each must match a signed result. `template` is checked through what it resolves to (an unknown template never matches), `label` against the signed label, `chainId` as a number or numeric string, addresses case-insensitively; `decimals` is ignored because it is never signed |
+| `expectedWallet` | `{ address, walletType? }` | Optional. The wallet your own server-side sign-in proved. The JWT's `sub` must be this wallet (case-insensitive for EVM and Sui, exact for the others) and every signed result must be on its chain family (`walletType`, default `'evm'`); otherwise `pass` is `false` |
 | `pqJwt` | `string` | The post-quantum companion returned beside `jwt`. Checked and reported as `pq` |
 | `pqRequiredFrom` | `string \| Date` | Your own cutoff. A companion that is present and fails always rejects; an absent or unverifiable one rejects only once this date has passed, judged by your server's clock |
 
@@ -165,11 +169,11 @@ Returns `{ valid, pass, payload?, pq?, error? }`. Only treat the request as auth
 
 ### `useSkyeGate(options)` → `UseSkyeGateResult`
 
-React hook. Same options as `verifyConditions` (including `walletProof`), plus `enabled?: boolean` to gate the call. Returns `{ status, pass, jwt, pqJwt, error, refetch }` where `status` cycles through `'idle' → 'verifying' → 'pass' | 'fail' | 'error'`.
+React hook. Same options as `verifyConditions` (including `walletProof`), plus `enabled?: boolean` to gate the call. Returns `{ status, pass, jwt, pqJwt, receipt, error, refetch }` where `status` cycles through `'idle' → 'verifying' → 'pass' | 'fail' | 'error'`.
 
 ### `<GatedContent />`
 
-Declarative wrapper. Same options as the hook. Renders `children` only when the gate passes; renders `fallback` when the wallet does not meet the conditions; renders `loading` while verifying. Set `errorFallback` (a node, or `(error) => node`) to show something different when no verdict came back, such as an outage or a license problem; without it an error renders `fallback`, as before. Optional `onPass(jwt, pqJwt?)` callback fires once when the gate first passes; forward both tokens to your server.
+Declarative wrapper. Same options as the hook. Renders `children` only when the gate passes; renders `fallback` when the wallet does not meet the conditions; renders `loading` while verifying. Set `errorFallback` (a node, or `(error) => node`) to show something different when no verdict came back, such as an outage or a license problem; without it an error renders `fallback`, as before. Optional `onPass(jwt, pqJwt?, receipt?)` callback fires once when the gate first passes; forward all three to your server.
 
 ## Condition types
 
@@ -202,10 +206,11 @@ skyemeta.com/api/verify   ← Skye Meta proxy validates SKYE key + domain
   ↓
 api.insumermodel.com      ← InsumerAPI returns a signed boolean; no balances leak
   ↓
-JWT signed with ECDSA P-256
+JWT signed with ECDSA P-256, plus Skye Meta's receipt for it
   ↓ POSTed to your server
   ↓
-validateContentToken(jwt, { pqJwt }) ← jose + JWKS, signature + issuer + expiry + condition match
+validateContentToken(jwt, { receipt, audience, pqJwt }) ← jose + JWKS, signature + issuer + expiry
+                                        + receipt (your site, this JWT, a proven wallet) + condition match
                                         + post-quantum companion (ML-DSA-65) reported as pq
   ↓
 gated content delivered

@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.5.0
+
+Breaking: `validateContentToken` requires Skye Meta's receipt and the route's conditions.
+
+A JWT with `pass: true` says a wallet meets the conditions, and anyone can request one for any
+public wallet straight from InsumerAPI, without the Skye Meta proxy and without proving they
+control that wallet. Before 0.5.0 such a JWT passed `validateContentToken`.
+
+- The proxy now returns `receipt` beside the JWT when the call carried your license and an
+  ownership proof for every wallet it named. It is signed by Skye Meta (keys at
+  `https://skyemeta.com/.well-known/skyegate-jwks.json`), issued for your domain, names the JWT's
+  wallet, and carries the hash of that exact JWT. It lives at most 5 minutes.
+- `verifyConditions` returns `receipt`; `useSkyeGate` returns it; `<GatedContent onPass>` gets it
+  as a third argument.
+- `validateContentToken(jwt, options)` now requires `receipt` and `audience` (your domain), and
+  `expectedConditions`. A missing or mismatched receipt is `pass: false` with the reason in
+  `error`.
+- Servers that prove the visitor's wallet themselves can pass `allowDirectAttestations: true`
+  with `expectedWallet` instead of a receipt.
+
+Upgrade: send `receipt` from the browser to your server with the JWT, and add `receipt`,
+`audience` and `expectedConditions` to your `validateContentToken` call.
+
 ## 0.4.8
 
 - `validateContentToken` takes `expectedWallet: { address, walletType? }`: the wallet your own
